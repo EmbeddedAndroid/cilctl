@@ -1242,5 +1242,74 @@ class License(unittest.TestCase):
         self.assertEqual(hashlib.sha256(text).hexdigest(), "62202d807008dd88e4140baf7155990a4c5f29666fe2f31d392aad8368d5cc87")
 
 
+@unittest.skipUnless(BASH and shutil.which("git"), "tools/scrub.sh is a POSIX shell script")
+class Scrub(unittest.TestCase):
+    # built at run time, or the scrub of this repository would find them
+    A, B, C = (".".join(map(str, o)) for o in ((10, 1, 2, 3), (10, 8, 8, 8), (192, 168, 7, 7)))
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="cilctl-scrub-")
+        self.r = os.path.join(self.d, "r")
+        os.makedirs(os.path.join(self.r, "tools"))
+        shutil.copy(os.path.join(ROOT, "tools", "scrub.sh"), os.path.join(self.r, "tools"))
+        self.git("init", "-q")
+        self.commit("README", "docs at 192.0.2.1\n", "add a readme")
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def git(self, *a):
+        subprocess.run(["git", "-C", self.r, "-c", "user.name=T", "-c", "user.email=t@example.com"] + list(a),
+                       check=True, stdout=subprocess.DEVNULL)
+
+    def commit(self, name, text, msg):
+        with open(os.path.join(self.r, name), "a") as f:
+            f.write(text)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", msg)
+
+    def scrub(self, d=None, extra=""):
+        r = subprocess.run(["sh", os.path.join(self.r, "tools", "scrub.sh")] + ([d] if d else []),
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=dict(os.environ, SCRUB_EXTRA=extra))
+        return r.returncode, r.stdout.decode()
+
+    def test_clean(self):
+        self.assertEqual(self.scrub(), (0, "scrub: clean (2 files)\n"))
+
+    def test_history(self):
+        # an address added and removed again is still in the history
+        self.commit("README", "host %s\n" % self.A, "add a host")
+        with open(os.path.join(self.r, "README"), "w") as f:
+            f.write("docs\n")
+        self.git("commit", "-q", "-am", "drop the host")
+        rc, out = self.scrub()
+        self.assertEqual(rc, 1)
+        self.assertIn("history:+host " + self.A, out)
+
+    def test_message_of_scrub_only_commit(self):
+        self.commit("tools/scrub.sh", "\n", "tools: tested on " + self.B)
+        rc, out = self.scrub()
+        self.assertEqual(rc, 1)
+        self.assertIn("history:tools: tested on " + self.B, out)
+
+    def test_tree_and_worktree(self):
+        self.commit("notes", "ssh admin@%s\n" % self.C, "add notes")
+        rc, out = self.scrub()
+        self.assertEqual(rc, 1)
+        self.assertIn("/notes:1:ssh admin@" + self.C, out)
+        os.unlink(os.path.join(self.r, "notes"))
+        self.git("commit", "-q", "-am", "drop notes")
+        self.git("reset", "-q", "--hard", "HEAD~2")
+        self.git("reflog", "expire", "--expire=now", "--all")
+        self.git("gc", "-q", "--prune=now")
+        # .git is a file in a worktree, naming the main tree's path
+        w = os.path.join(self.d, "w")
+        self.git("worktree", "add", "-q", w)
+        extra = os.path.join(self.d, "extra.txt")
+        with open(extra, "w") as f:
+            f.write("cilctl-scrub-\n")
+        self.assertEqual(self.scrub(w, extra), (0, "scrub: clean (2 files)\n"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

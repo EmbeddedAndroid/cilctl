@@ -195,6 +195,7 @@ Offline, against a stub API (no network), on any of the three OSes:
 
 ```
 python3 tests/test_cilctl.py      # py -3 tests\test_cilctl.py on Windows
+tools/scrub.sh                    # no internal hosts, addresses or keys
 ```
 
 ## License
