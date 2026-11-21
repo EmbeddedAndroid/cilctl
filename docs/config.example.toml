@@ -1,0 +1,52 @@
+# cilctl configuration: copy to ~/.config/cilctl/config.toml (or point
+# CILCTL_CONFIG at it) and change the URLs. cilctl reads a TOML subset:
+# tables, strings ("basic", 'literal', '''multi-line literal'''),
+# integers, booleans and comments.
+
+# the profile used when neither --cil nor CILCTL_CIL picks one
+default = "lab"
+
+# [cil.NAME]: a CIL instance. url is required; pool and image default to
+# the CIL's only pool and that pool's only image; jump is a comma
+# separated ssh ProxyJump chain (user@host[:port]) for when the CIL and
+# its lease addresses are not reachable from this machine directly.
+[cil.lab]
+url = "http://cil.example.com:8086"
+pool = "arm64"
+image = "ubuntu-24.04-arm64"
+
+[cil.remote]
+url = "http://192.0.2.10:8086"
+jump = "me@bastion.example.com:2222"
+
+# [setup.NAME]: a recipe for "cilctl up --setup NAME" and
+# "cilctl setup <id> NAME": fetch a GGUF model (sha256 checked), run it
+# with llama-server as cilctl-llama.service on 127.0.0.1:8080, install
+# OpenCode with a config that uses it, then check /health and a tool call.
+# The guest image must provide llama-server (on PATH, or after sourcing
+# env_script).
+[setup.small]
+model_url = "https://models.example.com/qwen3-4b/Qwen3-4B-Q4_K_M.gguf"
+model_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+model_direct = false                  # true: fetch without the guest's http proxy
+alias = "qwen3-4b"                    # the model name OpenCode asks for
+title = "Qwen3-4B Q4_K_M"             # shown in OpenCode
+context = 32768                       # llama-server -c and OpenCode's context limit
+output = 8192                         # OpenCode's output limit
+reasoning = true                      # the model emits reasoning
+server_args = "-ngl 99 -t 8"          # extra llama-server arguments
+env_script = ""                       # sourced before llama-server starts
+free_mb = 4000                        # free disk needed before the download
+# lease size for "up --setup small" (each can be overridden on up)
+npus = 0
+cpu = 8
+ram = 16384
+disk = 40
+ttl = 240
+# a guest shell check that must pass first; its output is shown, and a
+# non-zero exit stops the setup with that output as the reason
+precheck = '''
+mem=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+[ "$mem" -ge 12000 ] || { echo "MemTotal ${mem} MB, want 12000"; exit 1; }
+echo "mem=${mem}MB"
+'''

@@ -1,0 +1,1338 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+"""cilctl: lease VMs from a CIL instance. Python 3.9+, standard library
+only; runs on Linux, macOS and Windows (py -3 cilctl, or cilctl.cmd).
+
+  cilctl [--cil NAME] [--url URL] [--jump HOPS] <command> ...
+
+  cils                      the configured CIL profiles; * = selected
+  setups                    the configured setup recipes
+  health | pools | hosts | images | leases
+  request <requester> [image] [cpu] [ram_mb] [disk_gb] [ttl_min] [npus]
+  wait <id>                 poll until ready; store the key (dropped if
+                            the lease has failed or is released)
+  up [--name SLUG] [--image I] [--cpu N] [--ram MB] [--disk GB]
+     [--ttl MIN] [--npus N] [--setup RECIPE]
+                            request + wait (+ setup); prints how to connect
+  setup <id> RECIPE         llama-server with a model, plus OpenCode
+  ssh <id> [cmd...]         shell, or one command (one argument is a
+                            shell line); ~/.opencode/bin is on PATH
+  opencode <id> [dir]       OpenCode TUI in the lease
+  forward <id> [local_port] [remote_port]
+                            forward 127.0.0.1:local_port to the lease's
+                            127.0.0.1:remote_port (default 8080 8080)
+  copy|scp <id> SRC... DST  copy up or down; lease paths start with ':'
+  apt <id>                  optional: point the guest's apt at the CIL mirror
+  extend <id> <min>
+  events <id>
+  release <id>              delete, wait for released, drop the key
+  doctor [id]               which route reaches the API and the lease
+
+The CIL is --url, else $CILCTL_URL, else the url of the selected profile
+(--cil, $CILCTL_CIL, or the config's default). Profiles and setup recipes
+live in $CILCTL_CONFIG (default ~/.config/cilctl/config.toml); see the
+README. The jump hops (user@host[:port],...) are --jump, else
+$CILCTL_JUMP, else the profile's; "none" turns them off.
+
+Lease responses carry the VM's private ssh key: they are parsed here and
+only allowlisted fields are printed. Keys live in
+$CILCTL_STATE/<profile>/<id>/key (default ~/.cache/cilctl; 0600, an
+owner-only ACL on Windows) and are deleted on release.
+
+Environment: CILCTL_URL, CILCTL_CIL, CILCTL_JUMP, CILCTL_POOL,
+CILCTL_CONFIG, CILCTL_STATE, CILCTL_SSH and CILCTL_SCP (client binaries).
+"""
+import atexit
+import http.client
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+PROG = "cilctl"
+WINDOWS = os.name == "nt"
+POLL_S = 20
+POLL_N = 90
+RELEASE_TRIES = 3
+RELEASE_WAIT_S = 5
+REMOTE_PATH = "export PATH=$HOME/.opencode/bin:$HOME/.local/bin:$PATH; "
+
+SLUG = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+IMAGE = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
+NUM = re.compile(r"^(0|[1-9][0-9]*)$")
+URL = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._/-]*)?$")
+# lower case, a letter first (digits are lease ids in a state dir); "_" is
+# kept for the state dirs of bare URLs
+NAME = re.compile(r"^[a-z][a-z0-9-]*$")
+RECIPE_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+WIN_DEVICES = {"con", "prn", "aux", "nul"} | {"%s%d" % (x, n) for x in ("com", "lpt") for n in range(1, 10)}
+HOP = re.compile(r"^([A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?$")
+# the lease reply goes into ssh and scp argv: no leading "-", no spaces
+SSH_USER = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
+SSH_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:-]*$")
+
+
+def die(msg, rc=1):
+    print("%s: %s" % (PROG, msg), file=sys.stderr)
+    sys.exit(rc)
+
+
+def num(v, what):
+    if v is None or not NUM.match(v):
+        die("%s must be a number" % what)
+    return int(v)
+
+
+def lease_id(v):
+    return num(v, "id")
+
+
+# ---------------------------------------------------------------- config
+
+class TomlError(Exception):
+    pass
+
+
+ESC = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", '"': '"', "\\": "\\"}
+
+
+def toml_value(v, lines, i):
+    """(value, next line index) of the text after '='."""
+    def tail(rest):
+        if rest.strip() and not rest.strip().startswith("#"):
+            raise TomlError("text after the value")
+
+    if v.startswith("'''"):
+        rest = v[3:]
+        if "'''" in rest:
+            tail(rest[rest.index("'''") + 3:])
+            return rest[:rest.index("'''")], i
+        parts = [rest] if rest else []
+        while i < len(lines):
+            ln = lines[i]
+            i += 1
+            if "'''" in ln:
+                tail(ln[ln.index("'''") + 3:])
+                parts.append(ln[:ln.index("'''")])
+                return "\n".join(parts), i
+            parts.append(ln)
+        raise TomlError("unterminated '''")
+    if v.startswith("'"):
+        m = re.match(r"^'([^'\n]*)'(.*)$", v)
+        if not m:
+            raise TomlError("unterminated string")
+        tail(m.group(2))
+        return m.group(1), i
+    if v.startswith('"'):
+        if v.startswith('"""'):
+            raise TomlError('""" strings are not supported; use \'\'\'')
+        m = re.match(r'^"((?:[^"\\\n]|\\.)*)"(.*)$', v)
+        if not m:
+            raise TomlError("unterminated string")
+        tail(m.group(2))
+
+        def esc(e):
+            s = e.group(1)
+            if s[0] in "uU":
+                return chr(int(s[1:], 16))
+            return ESC[s]
+        body = m.group(1)
+        if re.search(r'\\(?![btnfr"\\]|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})', body):
+            raise TomlError("bad escape")
+        return re.sub(r'\\(u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|.)', esc, body), i
+    m = re.match(r"^([+-]?(?:0|[1-9](?:_?[0-9])*)|true|false)(\s.*)?$", v)
+    if not m:
+        raise TomlError("unsupported value (cilctl reads strings, integers and booleans)")
+    tail(m.group(2) or "")
+    t = m.group(1)
+    if t in ("true", "false"):
+        return t == "true", i
+    return int(t.replace("_", "")), i
+
+
+def parse_toml(text):
+    """The TOML subset of cilctl's config: [table] and [a.b] headers,
+    bare keys, "basic" and 'literal' strings, '''multi-line literal'''
+    strings, integers, booleans and comments."""
+    lines = text.split("\n")
+    root, seen, i = {}, set(), 0
+    cur = root
+    while i < len(lines):
+        s = lines[i].strip()
+        i += 1
+        try:
+            if not s or s.startswith("#"):
+                continue
+            if s.startswith("["):
+                m = re.match(r"^\[\s*([A-Za-z0-9_-]+(?:\s*\.\s*[A-Za-z0-9_-]+)*)\s*\]\s*(#.*)?$", s)
+                if not m:
+                    raise TomlError("bad table header")
+                path = tuple(p.strip() for p in m.group(1).split("."))
+                if path in seen:
+                    raise TomlError("table [%s] defined twice" % ".".join(path))
+                seen.add(path)
+                cur = root
+                for p in path:
+                    cur = cur.setdefault(p, {})
+                    if not isinstance(cur, dict):
+                        raise TomlError("%s is a value, not a table" % p)
+                continue
+            m = re.match(r"^([A-Za-z0-9_-]+)\s*=\s*(.*)$", s)
+            if not m:
+                raise TomlError("expected key = value")
+            k, v = m.groups()
+            if k in cur:
+                raise TomlError("key %s defined twice" % k)
+            cur[k], i = toml_value(v, lines, i)
+        except TomlError as e:
+            raise TomlError("line %d: %s" % (i, e))
+    return root
+
+
+def config_path():
+    p = os.environ.get("CILCTL_CONFIG")
+    if p:
+        return p
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "cilctl", "config.toml")
+
+
+CIL_KEYS = {"url": str, "pool": str, "image": str, "jump": str}
+SETUP_KEYS = {"model_url": str, "model_sha256": str, "model_direct": bool, "alias": str, "title": str, "context": int,
+              "output": int, "reasoning": bool, "server_args": str, "env_script": str, "precheck": str,
+              "free_mb": int, "image": str, "npus": int, "cpu": int, "ram": int, "disk": int, "ttl": int,
+              "opencode_url": str, "opencode_sha256": str}
+SETUP_DEFAULTS = {"model_direct": False, "output": 8192, "reasoning": False, "server_args": "", "env_script": "", "precheck": "",
+                  "free_mb": 0, "npus": 0, "cpu": 4, "ram": 8192, "disk": 50, "ttl": 240}
+SETUP_REQUIRED = ("model_url", "model_sha256", "alias", "context")
+SHA = re.compile(r"^[0-9a-f]{64}$")
+MODEL_URL = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]+)?/([A-Za-z0-9._~%/-]*/)?[A-Za-z0-9._-]+$")
+ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+TITLE = re.compile(r"^[A-Za-z0-9 ._()+,:/-]*$")
+# written into a systemd EnvironmentFile, which would interpret quotes
+ARGS = re.compile(r"^[A-Za-z0-9 ._,=:/+-]*$")
+PATHNAME = re.compile(r"^(/[A-Za-z0-9._-]+)*$")
+
+
+def check_table(p, kind, n, v, keys):
+    if kind == "setup" and not RECIPE_NAME.match(n):
+        die("%s: setup %r: a name is lower case letters, digits and '-'" % (p, n))
+    if kind == "cil" and (not NAME.match(n) or n in WIN_DEVICES):
+        die("%s: cil %r: a name is lower case, starts with a letter, and is not a Windows device" % (p, n))
+    if not isinstance(v, dict):
+        die("%s: %s.%s must be a table" % (p, kind, n))
+    for k, x in v.items():
+        t = keys.get(k)
+        # bool is an int in Python; neither stands in for the other
+        if t is None or type(x) is not t:
+            die("%s: %s.%s: unknown key %r or wrong type (keys: %s)" % (p, kind, n, k, ", ".join(sorted(keys))))
+
+
+def check_setup(p, n, v):
+    w = "%s: setup.%s" % (p, n)
+    for k in SETUP_REQUIRED:
+        if k not in v:
+            die("%s needs %s" % (w, k))
+    v = dict(SETUP_DEFAULTS, **v)
+    v.setdefault("title", v["alias"])
+    for k, rx in (("model_url", MODEL_URL), ("alias", ALIAS), ("title", TITLE), ("server_args", ARGS),
+                  ("env_script", PATHNAME)):
+        if not rx.match(v[k]):
+            die("%s: bad %s %r" % (w, k, v[k]))
+    if not SHA.match(v["model_sha256"]):
+        die("%s: model_sha256 is 64 lower-case hex digits" % w)
+    if ("opencode_url" in v) != ("opencode_sha256" in v):
+        die("%s: opencode_url and opencode_sha256 go together" % w)
+    if "opencode_url" in v and (not MODEL_URL.match(v["opencode_url"]) or not SHA.match(v["opencode_sha256"])):
+        die("%s: bad opencode_url or opencode_sha256" % w)
+    if "image" in v and not IMAGE.match(v["image"]):
+        die("%s: bad image" % w)
+    for k in ("context", "output", "free_mb", "npus", "cpu", "ram", "disk", "ttl"):
+        if v[k] < 0:
+            die("%s: %s must not be negative" % (w, k))
+    return v
+
+
+def load_config():
+    """(path, cils, setups, default profile or None)."""
+    p = config_path()
+    try:
+        with open(p, encoding="utf-8-sig") as f:
+            c = parse_toml(f.read())
+    except FileNotFoundError:
+        if os.environ.get("CILCTL_CONFIG"):
+            die("%s: no such file (CILCTL_CONFIG)" % p)
+        c = {}
+    except (OSError, UnicodeError) as e:
+        die("%s: %s" % (p, e))
+    except TomlError as e:
+        die("%s: %s" % (p, e))
+    if set(c) - {"default", "cil", "setup"}:
+        die("%s: top-level keys are default, [cil.NAME] and [setup.NAME]" % p)
+    cils, setups = c.get("cil", {}), c.get("setup", {})
+    if not isinstance(cils, dict) or not isinstance(setups, dict):
+        die("%s: cil and setup are tables of tables" % p)
+    for n, v in cils.items():
+        check_table(p, "cil", n, v, CIL_KEYS)
+        if "url" not in v:
+            die("%s: cil.%s needs url" % (p, n))
+        v["url"] = v["url"].rstrip("/")
+        if not URL.match(v["url"]):
+            die("%s: cil.%s: url must be http(s)://host[:port][/path]" % (p, n))
+        if "pool" in v and not SLUG.match(v["pool"]) or "image" in v and not IMAGE.match(v["image"]):
+            die("%s: cil.%s: bad pool or image name" % (p, n))
+    for n, v in list(setups.items()):
+        check_table(p, "setup", n, v, SETUP_KEYS)
+        setups[n] = check_setup(p, n, v)
+    d = c.get("default")
+    if d is not None and (not isinstance(d, str) or d not in cils):
+        die("%s: default %r is not a [cil.NAME] profile" % (p, d))
+    return p, cils, setups, d
+
+
+class Cfg:
+    def __init__(self, url=None, jump=None, cil=None, need_url=True):
+        self.path, self.cils, self.setups, default = load_config()
+        jump_flag = jump is not None
+        url_from = "--url" if url else None
+        if not url and os.environ.get("CILCTL_URL"):
+            url, url_from = os.environ["CILCTL_URL"], "CILCTL_URL"
+        # an explicit URL alone means no profile, not the default one
+        self.cil = cil or os.environ.get("CILCTL_CIL") or (None if url else default)
+        if self.cil is not None and self.cil not in self.cils:
+            die("unknown cil %r (profiles in %s: %s)" % (self.cil, self.path, ", ".join(sorted(self.cils)) or "none"))
+        prof = self.cils.get(self.cil, {})
+        self.url = (url or prof.get("url") or "").rstrip("/")
+        if not url_from and self.cil:
+            url_from = "cil.%s url" % self.cil
+        if self.url and not URL.match(self.url):
+            die("%s must be http(s)://host[:port][/path]" % url_from)
+        if need_url and not self.url:
+            die("no CIL: pass --url, set CILCTL_URL, or add a [cil.NAME] profile to %s" % self.path)
+        self.pool = os.environ.get("CILCTL_POOL") or prof.get("pool")
+        if self.pool and not SLUG.match(self.pool):
+            die("bad pool name %r" % self.pool)
+        self.image = prof.get("image")
+        st = os.environ.get("CILCTL_STATE") or os.path.join(os.path.expanduser("~"), ".cache", "cilctl")
+        if self.cil:
+            self.name = self.cil
+        else:
+            # "_" never appears in a profile name, so these never collide
+            self.name = "url_" + re.sub(r"[^A-Za-z0-9.-]", "_", urllib.parse.urlsplit(self.url).netloc)
+        self.state = os.path.join(st, self.name)
+        if jump is None:
+            jump = os.environ.get("CILCTL_JUMP")
+        if jump is None:
+            jump = prof.get("jump", "")
+        self.jump = [h for h in jump.split(",") if h] if jump != "none" else []
+        for h in self.jump:
+            if not HOP.match(h):
+                die("jump: bad hop %r (user@host[:port],...)" % h)
+        self.ssh = os.environ.get("CILCTL_SSH") or find_tool("ssh")
+        self.scp = os.environ.get("CILCTL_SCP") or find_tool("scp")
+        # flags the commands cilctl suggests must repeat to reach this CIL
+        # the same way (environment and default profile carry over)
+        again = []
+        if cil:
+            again += ["--cil", cil]
+        if url_from == "--url":
+            again += ["--url", self.url]
+        if jump_flag:
+            again += ["--jump", ",".join(self.jump) or "none"]
+        self.cmd = " ".join([PROG] + again)
+
+    def hint(self, fmt, *a):
+        """A cilctl command line to suggest: fmt % a after the flags."""
+        return "%s %s" % (self.cmd, fmt % a)
+
+    def lease_dir(self, i):
+        return os.path.join(self.state, str(i))
+
+    def drop(self, i):
+        shutil.rmtree(self.lease_dir(i), ignore_errors=True)
+
+    def recipe(self, n):
+        if n not in self.setups:
+            die("unknown setup recipe %r (recipes in %s: %s)" % (n, self.path, ", ".join(sorted(self.setups)) or
+                                                                 "none"))
+        return self.setups[n]
+
+
+def find_tool(name):
+    p = shutil.which(name)
+    if p:
+        return p
+    if WINDOWS:
+        w = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "OpenSSH", name + ".exe")
+        if os.path.exists(w):
+            return w
+    return name
+
+
+# ---------------------------------------------------------------- API
+
+class Api:
+    """CIL REST calls. When the API is not reachable directly and jump
+    hops are configured, the calls go through an ssh -L tunnel to the
+    last hop, which must reach the CIL itself."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        u = urllib.parse.urlsplit(cfg.url)
+        self.host = u.hostname
+        self.port = u.port or (443 if u.scheme == "https" else 80)
+        self.route = None
+        self.tunnel = None
+
+    def direct_ok(self, timeout=4):
+        try:
+            socket.create_connection((self.host, self.port), timeout).close()
+            return True
+        except OSError:
+            return False
+
+    def tunnel_argv(self, lport):
+        hops = self.cfg.jump
+        a = [self.cfg.ssh, "-N", "-o", "ExitOnForwardFailure=yes", "-o", "BatchMode=yes",
+             "-o", "ConnectTimeout=10", "-L", "127.0.0.1:%d:%s:%d" % (lport, self.host, self.port)]
+        if len(hops) > 1:
+            a += ["-J", ",".join(hops[:-1])]
+        last = hops[-1]
+        m = re.match(r"^(.*):([0-9]+)$", last)
+        if m:
+            a += ["-p", m.group(2)]
+            last = m.group(1)
+        return a + [last]
+
+    def open_tunnel(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        lport = s.getsockname()[1]
+        s.close()
+        log = tempfile.TemporaryFile()
+        p = subprocess.Popen(self.tunnel_argv(lport), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=log)
+        atexit.register(stop_proc, p)
+        for _ in range(150):
+            if p.poll() is not None:
+                log.seek(0)
+                err = log.read().decode(errors="replace").strip().splitlines()
+                return "ssh tunnel via %s exited: %s" % (",".join(self.cfg.jump), (err or ["?"])[-1][:200])
+            try:
+                socket.create_connection(("127.0.0.1", lport), 1).close()
+                break
+            except OSError:
+                time.sleep(0.2)
+        else:
+            return "ssh tunnel via %s did not come up" % ",".join(self.cfg.jump)
+        self.tunnel = p
+        self.opener = tunnel_opener(lport)
+        return None
+
+    def connect(self):
+        if self.route:
+            return
+        if self.direct_ok():
+            self.route = "direct"
+            return
+        if not self.cfg.jump:
+            die("cannot reach %s (wrong network or no VPN? else set --jump, CILCTL_JUMP or the profile's "
+                "jump; see %s)" % (self.cfg.url, self.cfg.hint("doctor")))
+        err = self.open_tunnel()
+        if err:
+            die("cannot reach %s directly, and %s" % (self.cfg.url, err))
+        self.route = "jump"
+
+    # never through http_proxy: the route was probed directly, and a
+    # proxy cannot reach the jump tunnel on this machine's 127.0.0.1
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def raw(self, method, path, body=None, timeout=60):
+        """(status, text) of one call; path is relative to the URL."""
+        self.connect()
+        data = None
+        hdr = {}
+        if body is not None:
+            data = json.dumps(body).encode()
+            hdr["Content-Type"] = "application/json"
+        req = urllib.request.Request(self.cfg.url + path, data=data, method=method, headers=hdr)
+        try:
+            with self.opener.open(req, timeout=timeout) as r:
+                return r.status, r.read().decode(errors="replace")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode(errors="replace")
+        except (urllib.error.URLError, OSError) as e:
+            raise ApiDown(str(getattr(e, "reason", e)))
+
+    def call(self, method, path, body=None, timeout=60):
+        """(status, parsed JSON or None) of one /api/v1 call."""
+        try:
+            code, text = self.raw(method, "/api/v1" + path, body, timeout)
+        except ApiDown as e:
+            die("CIL unreachable: %s" % e)
+        try:
+            return code, json.loads(text)
+        except ValueError:
+            return code, None
+
+    def json(self, method, path, body=None, timeout=60):
+        code, d = self.call(method, path, body, timeout)
+        if d is None:
+            sys.exit("error: non-JSON reply from CIL (HTTP %d)" % code)
+        return d
+
+
+class ApiDown(Exception):
+    pass
+
+
+def tunnel_opener(lport):
+    """An opener that dials the tunnel's 127.0.0.1:lport but keeps the
+    URL's host for the Host header and for TLS (SNI and the certificate
+    name check)."""
+    ctx = ssl.create_default_context()
+
+    class Http(http.client.HTTPConnection):
+        def connect(self):
+            self.sock = socket.create_connection(("127.0.0.1", lport), self.timeout)
+
+    class Https(http.client.HTTPSConnection):
+        def connect(self):
+            s = socket.create_connection(("127.0.0.1", lport), self.timeout)
+            self.sock = ctx.wrap_socket(s, server_hostname=self.host)
+
+    class H(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(Http, req)
+
+    class Hs(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(Https, req)
+
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), H(), Hs())
+
+
+def stop_proc(p):
+    if p.poll() is None:
+        p.terminate()
+        try:
+            p.wait(5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+
+def api_error(d):
+    if isinstance(d, dict) and "detail" in d and "id" not in d:
+        sys.exit("error: %s" % json.dumps(d["detail"])[:300])
+
+
+def show(d, fields):
+    """Print allowlisted fields of one object or of each list element."""
+    api_error(d)
+    for o in d if isinstance(d, list) else [d]:
+        print(" ".join("%s=%s" % (f, o.get(f)) for f in fields))
+
+
+def pool_image(cfg, api, image):
+    """The pool and image of a new lease: the profile's (or CILCTL_POOL),
+    else the CIL's only pool and that pool's only allowed image."""
+    pool = cfg.pool
+    if pool and image:
+        return pool, image
+    ps = api.json("GET", "/pools")
+    api_error(ps)
+    ps = [p for p in ps if isinstance(p, dict)] if isinstance(ps, list) else []
+    if not pool:
+        names = [p.get("name") for p in ps]
+        if len(names) != 1:
+            die("the CIL has pools %s: set pool in the profile or CILCTL_POOL" % (", ".join(map(str, names)) or
+                                                                                  "none"))
+        pool = names[0]
+        if not isinstance(pool, str) or not SLUG.match(pool):
+            die("the CIL's pool name %r is not usable" % pool)
+    if not image:
+        imgs = [p.get("allowed_images") for p in ps if p.get("name") == pool]
+        imgs = imgs[0] if imgs and isinstance(imgs[0], list) else []
+        if len(imgs) != 1:
+            die("pool %s allows %s: pick one with --image (or image in the profile)" % (
+                pool, ", ".join(map(str, imgs)) or "no listed image"))
+        image = imgs[0]
+    return pool, image
+
+
+# ---------------------------------------------------------------- keys
+
+def restrict_windows(path):
+    # The SID of the process token: USERNAME/USERDOMAIN can be stale or
+    # unset (runas, services, a changed profile) and then match no account.
+    r = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT)
+    sid = r.stdout.decode(errors="replace").strip().split(",")[-1].strip('"')
+    if r.returncode or not sid.startswith("S-"):
+        raise OSError("whoami /user: %s" % r.stdout.decode(errors="replace").strip()[:200])
+    r = subprocess.run(["icacls", path, "/inheritance:r", "/grant:r", "*%s:F" % sid],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if r.returncode:
+        raise OSError("icacls: %s" % r.stdout.decode(errors="replace").strip()[:200])
+
+
+def store(cfg, i, d):
+    """Write the key and connection of a ready lease; return a status line
+    with allowlisted fields only. None for a reply that is not a lease."""
+    if not isinstance(d, dict) or "status" not in d:
+        return None
+    c = d.get("connection") or {}
+    if d["status"] in ("ready", "expiring") and c.get("private_key_pem"):
+        u, h, p = (str(x or "") for x in (c.get("user"), c.get("fwd_host") or c.get("host"),
+                                          c.get("fwd_port") or c.get("port")))
+        if not (SSH_USER.match(u) and SSH_HOST.match(h) and NUM.match(p) and 0 < int(p) < 65536):
+            die("lease %d: the CIL sent a bad ssh user, host or port; key not kept (%s)"
+                % (i, cfg.hint("release %d", i)))
+        st = cfg.lease_dir(i)
+        os.makedirs(st, mode=0o700, exist_ok=True)
+        key = os.path.join(st, "key")
+        if os.path.exists(key):
+            # an old key may be read-only (0400, the Windows attribute)
+            os.chmod(key, 0o600)
+            os.unlink(key)
+        fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        if WINDOWS:
+            # narrowed while still empty: the state dir's ACL is inherited
+            try:
+                restrict_windows(key)
+            except OSError as e:
+                os.close(fd)
+                os.unlink(key)
+                die("cannot restrict the key to this user (%s); key not kept" % e)
+        os.write(fd, c["private_key_pem"].encode())
+        os.close(fd)
+        with open(os.path.join(st, "conn"), "w") as f:
+            f.write("%s %s %s\n" % (u, h, p))
+    s = "%s host_id=%s expires_at=%s" % (d["status"], d.get("host_id"), d.get("expires_at"))
+    if d.get("last_error"):
+        s += " last_error=%s" % d["last_error"][:200]
+    return s
+
+
+def conn(cfg, i):
+    d = cfg.lease_dir(i)
+    try:
+        with open(os.path.join(d, "conn")) as f:
+            u, h, p = f.read().split()
+    except (OSError, ValueError):
+        die("no key for lease %d on %s (run: %s)" % (i, cfg.name, cfg.hint("wait %d", i)))
+    return d, u, h, p
+
+
+def ssh_opts(cfg, d, port_flag, port, jump=None):
+    o = ["-i", os.path.join(d, "key"), port_flag, port, "-o", "IdentitiesOnly=yes",
+         "-o", "StrictHostKeyChecking=accept-new",
+         # quoted for paths with spaces; ssh's option parser eats backslashes
+         "-o", 'UserKnownHostsFile="%s"' % os.path.join(d, "known_hosts").replace("\\", "/"),
+         "-o", "ServerAliveInterval=30"]
+    jump = cfg.jump if jump is None else jump
+    if jump:
+        o += ["-o", "ProxyJump=%s" % ",".join(jump)]
+    return o
+
+
+def ssh_argv(cfg, i, remote=None, tty=False, extra=(), jump=None):
+    d, u, h, p = conn(cfg, i)
+    a = [cfg.ssh] + ssh_opts(cfg, d, "-p", p, jump) + list(extra)
+    if tty:
+        a.append("-t")
+    a.append("%s@%s" % (u, h))
+    if remote is not None:
+        a.append(remote)
+    return a
+
+
+def remote_line(args):
+    """One argument is a shell line, several are a command and its
+    arguments; either way ~/.opencode/bin and ~/.local/bin are on PATH,
+    which a non-interactive ssh shell would not set."""
+    if not args:
+        return None
+    line = args[0] if len(args) == 1 else " ".join(shlex.quote(a) for a in args)
+    return REMOTE_PATH + line
+
+
+def run_tool(argv, stdin=None, replace=True):
+    """Run ssh/scp. On POSIX the process is replaced (tty and signals go
+    to ssh); Windows has no real exec, so wait and pass the exit code."""
+    if replace and stdin is None and not WINDOWS:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        try:
+            os.execvp(argv[0], argv)
+        except OSError as e:
+            die("cannot run %s: %s" % (argv[0], e))
+    try:
+        r = subprocess.run(argv, input=stdin)
+    except OSError as e:
+        die("cannot run %s: %s" % (argv[0], e))
+    return r.returncode
+
+
+def isatty():
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+# ---------------------------------------------------------------- commands
+
+def c_cils(cfg, api, a):
+    if not cfg.cils:
+        print("no profiles in %s" % cfg.path)
+    for n in sorted(cfg.cils):
+        c = cfg.cils[n]
+        if n == cfg.cil:
+            c = dict(c, url=cfg.url, jump=",".join(cfg.jump), pool=cfg.pool)
+        print("%s%s url=%s pool=%s image=%s jump=%s" % ("*" if n == cfg.cil else " ", n, c["url"],
+                                                       c.get("pool") or "auto", c.get("image") or "auto",
+                                                       c.get("jump") or "none"))
+    if cfg.url and not cfg.cil:
+        print("*(no profile) url=%s" % cfg.url)
+
+
+def c_setups(cfg, api, a):
+    if not cfg.setups:
+        print("no setup recipes in %s" % cfg.path)
+    for n in sorted(cfg.setups):
+        r = cfg.setups[n]
+        print("%s model=%s alias=%s context=%d npus=%d cpu=%d ram=%d disk=%d ttl=%d" % (
+            n, r["model_url"].rsplit("/", 1)[1], r["alias"], r["context"], r["npus"], r["cpu"], r["ram"],
+            r["disk"], r["ttl"]))
+
+
+def c_health(cfg, api, a):
+    try:
+        _, t = api.raw("GET", "/api/health", timeout=20)
+    except ApiDown as e:
+        die("CIL unreachable: %s" % e)
+    print(t)
+
+
+def c_pools(cfg, api, a):
+    show(api.json("GET", "/pools"), ["id", "name", "max_concurrent", "max_cpu", "max_ram_mb",
+                                     "max_disk_gb", "allowed_images", "env_keys"])
+
+
+def c_hosts(cfg, api, a):
+    show(api.json("GET", "/hosts"), ["id", "name", "state", "max_concurrent", "cpu_budget",
+                                     "ram_mb_budget", "state_detail"])
+
+
+def c_images(cfg, api, a):
+    show(api.json("GET", "/images"), ["name", "enabled", "default_user", "arch"])
+
+
+def c_leases(cfg, api, a):
+    show(api.json("GET", "/leases"), ["id", "status", "requester", "host_id", "image", "cpu",
+                                      "ram_mb", "expires_at"])
+
+
+def lease_body(requester, image, cpu, ram, disk, ttl, npus):
+    """Checked fields of a lease request; pool and image are added by
+    post_lease."""
+    if not SLUG.match(requester):
+        die("requester: lower-case kebab slug")
+    if image is not None and not IMAGE.match(image):
+        die("image: bad name")
+    v = {}
+    for k, x in (("cpu", cpu), ("ram_mb", ram), ("disk_gb", disk), ("ttl_min", ttl), ("npus", npus)):
+        v[k] = num(str(x), {"ram_mb": "ram", "disk_gb": "disk", "ttl_min": "ttl"}.get(k, k))
+    b = {"requester": requester, "image": image, "cpu": v["cpu"], "ram_mb": v["ram_mb"],
+         "disk_gb": v["disk_gb"], "ttl_min": v["ttl_min"]}
+    if v["npus"]:
+        b["npus"] = v["npus"]
+    return b
+
+
+def post_lease(cfg, api, b):
+    b["pool"], b["image"] = pool_image(cfg, api, b["image"])
+    r = api.json("POST", "/leases", b)
+    show(r, ["id", "status", "image", "cpu", "ram_mb", "disk_gb", "npus"])
+    return r
+
+
+def c_request(cfg, api, a):
+    if not a or len(a) > 7:
+        die("request <requester> [image] [cpu] [ram_mb] [disk_gb] [ttl_min] [npus]")
+    d = [cfg.image, "2", "2048", "20", "120", "0"]
+    v = list(a[1:]) + d[len(a) - 1:]
+    post_lease(cfg, api, lease_body(a[0], *v))
+
+
+def wait(cfg, api, i):
+    """0 ready, 1 failed/released/unknown/timeout."""
+    for n in range(POLL_N):
+        try:
+            _, t = api.raw("GET", "/api/v1/leases/%d" % i)
+            d = json.loads(t)
+        except (ApiDown, ValueError):
+            d = None
+            s = None
+        else:
+            s = store(cfg, i, d)
+            if s is None:
+                print("error: %s" % json.dumps(d.get("detail", "unexpected reply") if isinstance(d, dict)
+                                               else "unexpected reply")[:300], file=sys.stderr)
+                return 1
+        if s is not None:
+            print("%s %s" % (time.strftime("%H:%M:%S", time.gmtime()), s), flush=True)
+            st = s.split()[0]
+            if st in ("ready", "expiring"):
+                return 0
+            if st in ("failed", "released"):
+                cfg.drop(i)
+                return 1
+        if n + 1 < POLL_N:
+            time.sleep(POLL_S)
+    print("%s: lease %d not ready after %d min (%s)" % (PROG, i, POLL_S * POLL_N // 60, cfg.hint("events %d", i)),
+          file=sys.stderr)
+    return 1
+
+
+def c_wait(cfg, api, a):
+    return wait(cfg, api, lease_id(a[0] if a else None))
+
+
+def c_ssh(cfg, api, a):
+    i = lease_id(a[0] if a else None)
+    r = remote_line(a[1:])
+    return run_tool(ssh_argv(cfg, i, r, tty=r is not None and isatty()))
+
+
+def remote_dir(p):
+    if p in ("~", ""):
+        return "$HOME"
+    if p.startswith("~/"):
+        return "$HOME/" + shlex.quote(p[2:])
+    return shlex.quote(p)
+
+
+def c_opencode(cfg, api, a):
+    i = lease_id(a[0] if a else None)
+    if len(a) > 2:
+        die("opencode <id> [dir]")
+    if not isatty():
+        die("opencode needs a terminal; for a batch task: %s" % cfg.hint("ssh %d opencode run 'task'", i))
+    line = "cd %s && exec opencode" % remote_dir(a[1] if len(a) > 1 else "~")
+    return run_tool(ssh_argv(cfg, i, REMOTE_PATH + line, tty=True))
+
+
+def c_forward(cfg, api, a):
+    i = lease_id(a[0] if a else None)
+    lp = num(a[1], "local_port") if len(a) > 1 else 8080
+    rp = num(a[2], "remote_port") if len(a) > 2 else 8080
+    if len(a) > 3 or not (0 < lp < 65536 and 0 < rp < 65536):
+        die("forward <id> [local_port] [remote_port]")
+    print("lease %d 127.0.0.1:%d on http://127.0.0.1:%d/ (Ctrl-C to stop)" % (i, rp, lp), file=sys.stderr)
+    return run_tool(ssh_argv(cfg, i, None, extra=["-N", "-o", "ExitOnForwardFailure=yes",
+                                                  "-L", "127.0.0.1:%d:127.0.0.1:%d" % (lp, rp)]))
+
+
+def scp_argv(cfg, i, paths):
+    if len(paths) < 2:
+        die("copy <id> SRC... DST (lease paths start with ':', e.g. copy 7 a.txt : or copy 7 :out.log .)")
+    d, u, h, p = conn(cfg, i)
+    src, dst = paths[:-1], paths[-1]
+    up = dst.startswith(":")
+    if any(s.startswith(":") == up for s in src):
+        die("copy: either every SRC is on the lease (':path') and DST is local, or the reverse")
+    for x in paths:
+        if x.lstrip(":").startswith("-"):
+            die("copy: paths must not start with '-'")
+    r = lambda x: "%s@%s:%s" % (u, h, x[1:])
+    # scp reads a relative local "a:b" as host a
+    loc = lambda x: "./" + x if ":" in x.split("/")[0] and not os.path.isabs(x) else x
+    a = [cfg.scp, "-r"] + ssh_opts(cfg, d, "-P", p)
+    return a + ([loc(s) for s in src] + [r(dst)] if up else [r(s) for s in src] + [loc(dst)])
+
+
+def c_copy(cfg, api, a):
+    i = lease_id(a[0] if a else None)
+    return run_tool(scp_argv(cfg, i, list(a[1:])))
+
+
+APT = ("f=$(ls /etc/apt/sources.list.d/*.sources /etc/apt/mirrors/*.list /etc/apt/sources.list 2>/dev/null); "
+       "[ -n \"$f\" ] || { echo no-apt-sources; exit 1; }; "
+       "undo() { for x in $f; do sudo mv \"$x.cilctl-bak\" \"$x\"; done; exit 1; }; "
+       "sudo sed -i.cilctl-bak -E 's#https?://ports\\.ubuntu\\.com/ubuntu-ports#CIL/ubuntu-ports#g; "
+       "s#https?://(archive|security)\\.ubuntu\\.com/ubuntu([^-]|$)#CIL/ubuntu\\2#g; "
+       "s#https?://deb\\.debian\\.org/debian-security#CIL/debian-security#g; "
+       "s#https?://deb\\.debian\\.org/debian([^-]|$)#CIL/debian\\1#g' $f; "
+       "grep -qF 'CIL/' $f || { echo no-proxy-rewrite; undo; }; "
+       "sudo apt-get update > /tmp/cilctl-apt.log 2>&1; r=$?; "
+       "if [ $r != 0 ] || grep -qE '^(W|E):|^Err:' /tmp/cilctl-apt.log; then "
+       "grep -E '^(W|E):|^Err:' /tmp/cilctl-apt.log | head -5; undo; fi; "
+       "for x in $f; do sudo rm -f \"$x.cilctl-bak\"; done; echo apt-ok")
+
+
+def c_apt(cfg, api, a):
+    i = lease_id(a[0] if a else None)
+    # rewrite every archive URL to the CIL's mirror, then insist the
+    # rewrite happened and apt reached every source (apt-get exits 0 on W:);
+    # on a failure the sources are put back
+    return run_tool(ssh_argv(cfg, i, APT.replace("CIL", cfg.url)))
+
+
+def c_extend(cfg, api, a):
+    i = lease_id(a[0] if a else None)
+    m = num(a[1] if len(a) > 1 else None, "minutes")
+    show(api.json("POST", "/leases/%d/extend" % i, {"add_min": m}), ["id", "status", "expires_at"])
+
+
+def c_events(cfg, api, a):
+    i = lease_id(a[0] if a else None)
+    show(api.json("GET", "/leases/%d/events" % i), ["ts", "kind", "detail"])
+
+
+def c_release(cfg, api, a):
+    i = lease_id(a[0] if a else None)
+    # DELETE tears the guest down before it answers: released, or failed
+    # for a lease that had already failed (its leftovers are cleaned too).
+    # A frontend proxy may give up on a slow teardown with a 504 page while
+    # the lease stays up, so a gateway error is checked and the DELETE retried.
+    for n in range(RELEASE_TRIES):
+        code, d = api.call("DELETE", "/leases/%d" % i, timeout=300)
+        if d is not None and code not in (502, 503, 504):
+            break
+        _, g = api.call("GET", "/leases/%d" % i)
+        s = g.get("status") if isinstance(g, dict) else None
+        print("%s: DELETE lease %d: HTTP %d, lease %s" % (PROG, i, code, s), file=sys.stderr)
+        if s in ("released", "failed"):
+            d = {"status": s}
+            break
+        if n + 1 < RELEASE_TRIES:
+            time.sleep(RELEASE_WAIT_S)
+    else:
+        print("%s: lease %d is still %s; %s again later" % (PROG, i, s, cfg.hint("release %d", i)), file=sys.stderr)
+        return 1
+    s = d.get("status") if isinstance(d, dict) else None
+    if isinstance(d, dict) and "detail" in d and "id" not in d:
+        print("error: %s" % json.dumps(d["detail"])[:300], file=sys.stderr)
+    print("status=%s" % s)
+    if s in ("released", "failed"):
+        cfg.drop(i)
+        return 0
+    return 1
+
+
+# ---------------------------------------------------------------- setup
+
+OC_VER = "1.19.6"
+OC_URL = "https://github.com/anomalyco/opencode/releases/download/v%s/opencode-linux-arm64.tar.gz" % OC_VER
+OC_SHA = "0dc19cfbfaa07fbde5a8b574aab2319e898e2215a138618d7a7bd41ae7dee567"
+LLAMA_PORT = 8080
+
+# Runs in the guest as the lease user (bash -s), after the variable
+# assignments setup_script puts in front. Idempotent: every step checks
+# what is already there.
+SETUP_SH = r'''
+set -euo pipefail
+say() { echo "setup: $*"; }
+fail() { echo "setup: FAIL: $*" >&2; exit 1; }
+
+model_stamp() { echo "$2 $(stat -c '%s %Y' "$1")"; }
+
+# fetch_model URL SHA NOPROXY DEST NEED_MB: DEST checked against SHA,
+# fetched when missing or wrong; NOPROXY (a host) bypasses the guest's proxy
+fetch_model() {
+	local url=$1 sha=$2 noproxy=$3 m=$4 need=$5 avail t0 got
+	if [ -f "$m" ] && [ "$(cat "$m.ok" 2>/dev/null)" = "$(model_stamp "$m" "$sha")" ]; then
+		say "model present ($m)"
+		return 0
+	fi
+	if [ -f "$m" ]; then
+		say "checking $m"
+		[ "$(sha256sum "$m" | cut -d' ' -f1)" = "$sha" ] || { say "sha mismatch, fetching again"; rm -f "$m"; }
+	fi
+	if [ ! -f "$m" ]; then
+		mkdir -p "${m%/*}"
+		avail=$(df -Pm "${m%/*}" | awk 'NR == 2 {print $4}')
+		[ "$avail" -ge "$need" ] || fail "${avail} MB free in ${m%/*}; the recipe needs ${need} MB (lease a bigger --disk)"
+		say "fetching $url"
+		t0=$(date +%s)
+		# a rerun resumes the .part; 33 = the server does not do ranges
+		curl -fL --retry 3 -C - ${noproxy:+--noproxy "$noproxy"} -sS -o "$m.part" "$url" ||
+			{ [ $? != 33 ] || rm -f "$m.part"; fail "model download failed"; }
+		got=$(sha256sum "$m.part" | cut -d' ' -f1)
+		[ "$got" = "$sha" ] || { rm -f "$m.part"; fail "model sha256 $got, expected $sha"; }
+		mv "$m.part" "$m"
+		say "model fetched in $(( $(date +%s) - t0 )) s, sha256 ok"
+	fi
+	model_stamp "$m" "$sha" > "$m.ok"
+}
+
+# put PATH [MODE] < CONTENT: install with sudo if it differs; 0 if changed
+put() {
+	local t; t=$(mktemp)
+	cat > "$t"
+	if sudo cmp -s "$t" "$1"; then rm -f "$t"; return 1; fi
+	sudo install -m "${2:-0644}" "$t" "$1" || { rm -f "$t"; fail "cannot write $1"; }
+	rm -f "$t"
+}
+
+# write_service MODEL USER: cilctl-llama.service, its runner and its
+# settings; 0 if any changed. Settings: ALIAS CTX ARGS ENV_SCRIPT TITLE.
+write_service() {
+	local c=1 unit
+	put /etc/default/cilctl-llama <<EOF && c=0 || true
+# cilctl-llama.service settings; restart the service after editing
+MODEL=$1
+CTX=$CTX
+ALIAS=$ALIAS
+ARGS=$ARGS
+ENV_SCRIPT=$ENV_SCRIPT
+EOF
+	put /usr/local/bin/cilctl-llama 0755 <<EOF && c=0 || true
+#!/bin/bash
+# llama-server with the settings in /etc/default/cilctl-llama
+set -e
+[ -z "\${ENV_SCRIPT:-}" ] || . "\$ENV_SCRIPT"
+exec llama-server -m "\$MODEL" -c "\$CTX" --alias "\$ALIAS" --jinja --host 127.0.0.1 --port $PORT \$ARGS
+EOF
+	unit=$(cat <<'EOF'
+[Unit]
+Description=llama-server: @TITLE@ (127.0.0.1:@PORT@)
+After=network-online.target cloud-final.service
+Wants=network-online.target
+
+[Service]
+User=@USER@
+EnvironmentFile=/etc/default/cilctl-llama
+ExecStart=/usr/local/bin/cilctl-llama
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=600
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+)
+	unit=${unit/@USER@/$2}
+	unit=${unit/@TITLE@/$TITLE}
+	put /etc/systemd/system/cilctl-llama.service <<< "${unit/@PORT@/$PORT}" && c=0 || true
+	return $c
+}
+
+# oc_install URL SHA: OpenCode into ~/.opencode/bin
+oc_install() {
+	local oc=$HOME/.opencode/bin/opencode t
+	if [ -x "$oc" ] && [ "$(sha256sum "$oc" | cut -d' ' -f1)" = "$2" ]; then
+		say "opencode present ($("$oc" --version))"
+		return 0
+	fi
+	say "fetching $1"
+	t=$(mktemp -d)
+	curl -fL --retry 3 -sS -o "$t/oc.tar.gz" "$1" || { rm -rf "$t"; fail "opencode download failed"; }
+	tar -xzf "$t/oc.tar.gz" -C "$t" || { rm -rf "$t"; fail "opencode tarball broken"; }
+	[ "$(sha256sum "$t/opencode" | cut -d' ' -f1)" = "$2" ] || { rm -rf "$t"; fail "opencode sha256 mismatch"; }
+	mkdir -p "${oc%/*}"
+	install -m 0755 "$t/opencode" "$oc"
+	rm -rf "$t"
+	say "opencode $("$oc" --version) installed"
+}
+
+# oc_config: write $OC_JSON as the OpenCode config. Replaced only when
+# missing, from before cilctl (kept as .cilctl-bak) or equal to what
+# cilctl wrote last; an edited one is kept.
+oc_config() {
+	local c=$HOME/.config/opencode/opencode.json t
+	local l=$c.cilctl-last
+	mkdir -p "${c%/*}"
+	t=$(mktemp)
+	printf '%s\n' "$OC_JSON" > "$t"
+	if cmp -s "$t" "$c"; then
+		mv "$t" "$l"
+	elif [ ! -f "$c" ] || [ ! -f "$l" ] || cmp -s "$c" "$l"; then
+		[ ! -f "$c" ] || [ -f "$l" ] || cp "$c" "$c.cilctl-bak"
+		cp "$t" "$l"
+		mv "$t" "$c"
+		say "wrote $c"
+	else
+		mv "$t" "$c.cilctl-new"
+		say "kept your edited $c; cilctl's is $c.cilctl-new"
+	fi
+}
+
+wait_health() {
+	local i h
+	say "waiting for llama-server /health"
+	for i in $(seq 180); do
+		h=$(curl -s --noproxy '*' -m 5 "http://127.0.0.1:$PORT/health" || true)
+		case $h in *'"ok"'*) break ;; esac
+		if [ "$i" = 180 ]; then
+			sudo journalctl -u cilctl-llama.service -n 20 --no-pager >&2 || true
+			fail "llama-server not healthy after 15 min"
+		fi
+		sleep 5
+	done
+	say "llama-server healthy"
+}
+
+# a tool call through the OpenAI API: what OpenCode depends on
+tool_check() {
+	local r
+	r=$(curl -s --noproxy '*' -m 900 "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d '{
+ "model": "'"$ALIAS"'", "temperature": 0, "max_tokens": 512,
+ "chat_template_kwargs": {"enable_thinking": false},
+ "messages": [{"role": "user", "content": "What is the weather in Paris? Use the tool."}],
+ "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Current weather for a city",
+   "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]}') || r=
+	echo "$r" | python3 -c '
+import json, sys
+m = json.load(sys.stdin)["choices"][0]["message"]
+f = m["tool_calls"][0]["function"]
+assert f["name"] == "get_weather", f
+print("setup: tool call ok: %s(%s)" % (f["name"], json.loads(f["arguments"])))' || fail "no get_weather tool call in the reply: ${r:0:300}"
+}
+
+# tests: --fn NAME ARGS runs one function
+if [ "${1:-}" = --fn ]; then shift; "$@"; exit; fi
+
+if command -v cloud-init > /dev/null; then cloud-init status --wait > /dev/null 2>&1 || true; fi
+if [ -n "$PRECHECK" ]; then
+	why=$(bash -c "$PRECHECK" 2>&1) || fail "precheck: ${why:-failed}"
+	[ -z "$why" ] || say "precheck: $why"
+fi
+bash -c '[ -z "$1" ] || . "$1"; command -v llama-server' _ "$ENV_SCRIPT" > /dev/null ||
+	fail "no llama-server on PATH${ENV_SCRIPT:+ after $ENV_SCRIPT}; install llama.cpp in the image or set env_script"
+
+M=$HOME/models/${MODEL_URL##*/}
+fetch_model "$MODEL_URL" "$MODEL_SHA256" "$NOPROXY" "$M" "$FREE_MB"
+changed=0
+write_service "$M" "$(id -un)" && changed=1 || true
+sudo systemctl daemon-reload
+sudo systemctl enable -q cilctl-llama.service || fail "systemctl enable cilctl-llama failed"
+if [ $changed = 1 ] || ! systemctl is-active -q cilctl-llama.service; then
+	say "starting cilctl-llama.service"
+	sudo systemctl restart cilctl-llama.service
+fi
+oc_install "$OC_URL" "$OC_SHA"
+grep -qs 'opencode/bin' "$HOME/.bashrc" || echo 'export PATH=$HOME/.opencode/bin:$PATH' >> "$HOME/.bashrc"
+oc_config
+wait_health
+tool_check
+say "ready"
+'''
+
+
+def opencode_json(r):
+    m = {"name": r["title"], "tool_call": True, "reasoning": r["reasoning"],
+         "limit": {"context": r["context"], "output": r["output"]}}
+    c = {"$schema": "https://opencode.ai/config.json", "model": "llamacpp/" + r["alias"],
+         "small_model": "llamacpp/" + r["alias"], "autoupdate": False,
+         "provider": {"llamacpp": {"npm": "@ai-sdk/openai-compatible", "name": "llama.cpp (cilctl)",
+                                   "options": {"baseURL": "http://127.0.0.1:%d/v1" % LLAMA_PORT, "timeout": False,
+                                               "headerTimeout": 1800000, "chunkTimeout": 1800000},
+                                   "models": {r["alias"]: m}}}}
+    return json.dumps(c, indent=2)
+
+
+def setup_script(r):
+    """SETUP_SH with the recipe's settings assigned in front."""
+    v = {"MODEL_URL": r["model_url"], "MODEL_SHA256": r["model_sha256"],
+         "NOPROXY": urllib.parse.urlsplit(r["model_url"]).hostname if r["model_direct"] else "", "FREE_MB": str(r["free_mb"]),
+         "ALIAS": r["alias"], "TITLE": r["title"], "CTX": str(r["context"]), "ARGS": r["server_args"],
+         "ENV_SCRIPT": r["env_script"], "PRECHECK": r["precheck"], "PORT": str(LLAMA_PORT),
+         "OC_URL": r.get("opencode_url", OC_URL), "OC_SHA": r.get("opencode_sha256", OC_SHA),
+         "OC_JSON": opencode_json(r)}
+    return "".join("%s=%s\n" % (k, shlex.quote(x)) for k, x in v.items()) + SETUP_SH
+
+
+def setup(cfg, i, name):
+    r = cfg.recipe(name)
+    return run_tool(ssh_argv(cfg, i, "bash -s"), stdin=setup_script(r).encode(), replace=False)
+
+
+def c_setup(cfg, api, a):
+    if len(a) != 2:
+        die("setup <id> RECIPE")
+    i = lease_id(a[0])
+    rc = setup(cfg, i, a[1])
+    if rc == 0:
+        print("lease %d: %s" % (i, " | ".join(cfg.hint(c, i) for c in ("opencode %d", "ssh %d opencode run 'task'",
+                                                                         "forward %d"))))
+    return rc
+
+
+def default_name():
+    u = re.sub(r"[^a-z0-9]+", "-", (os.environ.get("USER") or os.environ.get("USERNAME") or "user").lower()).strip("-")
+    return "cilctl-%s" % (u or "user")
+
+
+def c_up(cfg, api, a):
+    o = {"name": None, "image": None, "cpu": None, "ram": None, "disk": None, "ttl": None,
+         "npus": None, "setup": None}
+    it = iter(a)
+    for x in it:
+        k, eq, v = x.partition("=")
+        k = k[2:] if k.startswith("--") else None
+        if k not in o:
+            die("up: unknown option %r" % x)
+        if not eq:
+            v = next(it, None)
+            if v is None:
+                die("up: --%s needs a value" % k)
+        o[k] = v
+    base = {"npus": 0, "cpu": 2, "ram": 2048, "disk": 20, "ttl": 120}
+    if o["setup"]:
+        r = cfg.recipe(o["setup"])
+        base = {k: r[k] for k in base}
+        base["image"] = r.get("image")
+    base.setdefault("image", None)
+    if base["image"] is None:
+        base["image"] = cfg.image
+    for k in base:
+        if o[k] is None:
+            o[k] = base[k]
+    b = lease_body(o["name"] or default_name(), o["image"], o["cpu"], o["ram"], o["disk"], o["ttl"], o["npus"])
+    r = post_lease(cfg, api, b)
+    i = r.get("id") if isinstance(r, dict) else None
+    if not isinstance(i, int):
+        return 1
+    if wait(cfg, api, i):
+        print("%s: lease %d is not ready; %s, then %s" % (PROG, i, cfg.hint("events %d", i), cfg.hint("release %d", i)),
+              file=sys.stderr)
+        return 1
+    if o["setup"]:
+        if setup(cfg, i, o["setup"]):
+            print("%s: setup failed; the lease is kept: %s, or %s" % (PROG, cfg.hint("ssh %d", i),
+                                                                       cfg.hint("release %d", i)), file=sys.stderr)
+            return 1
+    _, u, h, p = conn(cfg, i)
+    print("lease %d ready: %s@%s port %s" % (i, u, h, p))
+    hints = [("ssh %d", "shell"), ("ssh %d 'cmd'", "one command"),
+             ("copy %d FILE :", "upload to ~ (:path downloads)")]
+    if o["setup"]:
+        hints += [("opencode %d", "OpenCode TUI"),
+                  ("forward %d", "llama-server on http://127.0.0.1:%d/v1" % LLAMA_PORT)]
+    hints += [("extend %d MIN", "before it expires"), ("release %d", "when done")]
+    hints = [(cfg.hint(c, i), what) for c, what in hints]
+    w = max(len(c) for c, _ in hints)
+    for c, what in hints:
+        print("  %-*s  %s" % (w, c, what))
+    if cfg.cil is None:
+        print("  (no profile: pass the same --url or CILCTL_URL to every command on this lease)")
+    return 0
+
+
+def probe_ssh(cfg, i, jump):
+    a = ssh_argv(cfg, i, "true", extra=["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"], jump=jump)
+    try:
+        r = subprocess.run(a, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                           timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)[:200]
+    err = r.stderr.decode(errors="replace").strip().splitlines()
+    return r.returncode == 0, (err[-1][:200] if err else "")
+
+
+def c_doctor(cfg, api, a):
+    i = lease_id(a[0]) if a else None
+    print("python %s on %s" % (sys.version.split()[0], sys.platform))
+    for t in (cfg.ssh, cfg.scp):
+        print("%s: %s" % (os.path.basename(t), shutil.which(t) or "NOT FOUND"))
+    try:
+        v = subprocess.run([cfg.ssh, "-V"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout
+        print("ssh -V: %s" % v.decode(errors="replace").strip())
+    except OSError:
+        print("ssh -V: cannot run %s" % cfg.ssh)
+    print("config: %s%s" % (cfg.path, "" if os.path.exists(cfg.path) else " (none)"))
+    print("cil: %s (pool %s)" % (cfg.cil or "no profile", cfg.pool or "auto"))
+    print("state: %s" % cfg.state)
+    print("jump: %s" % (",".join(cfg.jump) or "none"))
+    ok = True
+    direct = api.direct_ok()
+    print("api direct %s: %s" % (cfg.url, "ok" if direct else "unreachable"))
+    if direct:
+        api.route = "direct"
+    elif cfg.jump:
+        err = api.open_tunnel()
+        print("api via jump: %s" % ("ok" if not err else err))
+        if not err:
+            api.route = "jump"
+    if api.route:
+        try:
+            _, t = api.raw("GET", "/api/health", timeout=20)
+            v = json.loads(t).get("version")
+            print("api health: version %s (route %s)" % (v, api.route))
+        except (ApiDown, ValueError, AttributeError) as e:
+            print("api health: bad reply (%s)" % e)
+            ok = False
+    else:
+        print("api: no route" + ("" if cfg.jump else " (set --jump, CILCTL_JUMP or the profile's jump)"))
+        ok = False
+    if i is not None:
+        lr = []
+        d, why = probe_ssh(cfg, i, [])
+        print("lease %d ssh direct: %s" % (i, "ok" if d else "fail %s" % why))
+        if d:
+            lr.append("direct")
+        if cfg.jump:
+            j, why = probe_ssh(cfg, i, cfg.jump)
+            print("lease %d ssh via jump: %s" % (i, "ok" if j else "fail %s" % why))
+            if j:
+                lr.append("jump")
+        print("lease %d route: %s" % (i, ", ".join(lr) or "none"))
+        ok = ok and bool(lr)
+    return 0 if ok else 1
+
+
+CMDS = {"cils": c_cils, "setups": c_setups, "health": c_health, "pools": c_pools, "hosts": c_hosts,
+        "images": c_images, "leases": c_leases, "request": c_request, "wait": c_wait, "up": c_up,
+        "setup": c_setup, "ssh": c_ssh, "opencode": c_opencode, "forward": c_forward, "copy": c_copy,
+        "scp": c_copy, "apt": c_apt, "extend": c_extend, "events": c_events, "release": c_release,
+        "doctor": c_doctor}
+NO_URL = ("cils", "setups")
+
+
+def main(argv):
+    url = jump = cil = None
+    while argv and argv[0].startswith("--") and argv[0] not in ("--help",):
+        k, _, v = argv.pop(0).partition("=")
+        if not _:
+            if not argv:
+                die("%s needs a value" % k)
+            v = argv.pop(0)
+        if k == "--url":
+            url = v or die("--url needs a value")
+        elif k == "--jump":
+            jump = v
+        elif k == "--cil":
+            cil = v or die("--cil needs a name")
+        else:
+            die("unknown option %s" % k, 2)
+    cmd = argv.pop(0) if argv else ""
+    f = CMDS.get(cmd)
+    if f is None:
+        print(__doc__.split("\n\n", 1)[1].rstrip())
+        return 0 if cmd in ("", "help", "--help", "-h") else 2
+    if not WINDOWS:
+        # exit through atexit, which stops the jump tunnel
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, lambda n, _: sys.exit(128 + n))
+    cfg = Cfg(url, jump, cil, need_url=cmd not in NO_URL)
+    try:
+        r = f(cfg, Api(cfg) if cfg.url else None, argv)
+    except KeyboardInterrupt:
+        return 130
+    return r if isinstance(r, int) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
