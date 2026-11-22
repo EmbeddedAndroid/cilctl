@@ -582,10 +582,13 @@ def restrict_windows(path):
     sid = r.stdout.decode(errors="replace").strip().split(",")[-1].strip('"')
     if r.returncode or not sid.startswith("S-"):
         raise OSError("whoami /user: %s" % r.stdout.decode(errors="replace").strip()[:200])
-    r = subprocess.run(["icacls", path, "/inheritance:r", "/grant:r", "*%s:F" % sid],
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    if r.returncode:
-        raise OSError("icacls: %s" % r.stdout.decode(errors="replace").strip()[:200])
+    # Some images give new files explicit SYSTEM, Administrators and
+    # OWNER RIGHTS entries, which /inheritance:r keeps: drop them too.
+    for args in (["/inheritance:r", "/grant:r", "*%s:F" % sid],
+                 ["/remove:g", "*S-1-5-18", "*S-1-5-32-544", "*S-1-3-4"]):
+        r = subprocess.run(["icacls", path] + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if r.returncode:
+            raise OSError("icacls: %s" % r.stdout.decode(errors="replace").strip()[:200])
 
 
 def store(cfg, i, d):
