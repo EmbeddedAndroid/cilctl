@@ -7,7 +7,8 @@ only; runs on Linux, macOS and Windows (py -3 cilctl, or cilctl.cmd).
 
   cils                      the configured CIL profiles; * = selected
   setups                    the configured setup recipes
-  health | pools | hosts | images | leases
+  health | pools | hosts | images
+  leases [--all]            live leases (queued to expiring); --all: every one
   request <requester> [image] [cpu] [ram_mb] [disk_gb] [ttl_min] [npus]
   wait <id>                 poll until ready; store the key (dropped if
                             the lease has failed or is released)
@@ -737,9 +738,26 @@ def c_images(cfg, api, a):
     show(api.json("GET", "/images"), ["name", "enabled", "default_user", "arch"])
 
 
+LIVE = ("queued", "provisioning", "ready", "expiring")
+LEASE_FIELDS = ["id", "status", "requester", "host_id", "image", "cpu", "ram_mb", "expires_at"]
+
+
 def c_leases(cfg, api, a):
-    show(api.json("GET", "/leases"), ["id", "status", "requester", "host_id", "image", "cpu",
-                                      "ram_mb", "expires_at"])
+    # The whole history carries every lease's key and grows without bound
+    # (770 KB on a busy CIL, cut off in transit), so ask per live status;
+    # the status check also covers a CIL that ignores the filter.
+    if a == ["--all"]:
+        return show(api.json("GET", "/leases"), LEASE_FIELDS)
+    if a:
+        die("usage: leases [--all]")
+    seen = {}
+    for st in LIVE:
+        d = api.json("GET", "/leases?status_=" + st)
+        api_error(d)
+        for o in d if isinstance(d, list) else []:
+            if isinstance(o, dict) and o.get("status") == st:
+                seen[o.get("id")] = o
+    show([seen[k] for k in sorted(seen, key=lambda i: -(i or 0))], LEASE_FIELDS)
 
 
 def lease_body(requester, image, cpu, ram, disk, ttl, npus):

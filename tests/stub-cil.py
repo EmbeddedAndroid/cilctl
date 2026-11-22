@@ -112,8 +112,12 @@ class H(BaseHTTPRequestHandler):
         if p == "/api/v1/images":
             return self.reply([{"name": "ubuntu-24.04-arm64", "enabled": True, "default_user": "ubuntu",
                                 "arch": "aarch64"}])
-        if p == "/api/v1/leases":
-            return self.reply([lease(7, "ready"), lease(8, "failed")])
+        if p.startswith("/api/v1/leases?status_=") or p == "/api/v1/leases":
+            every = [lease(9, "queued"), lease(7, "ready"), lease(8, "failed"), lease(4, "released")]
+            st = p.partition("status_=")[2]
+            if not st or pre == "/images":  # /images: a CIL that ignores the filter
+                return self.reply(every)
+            return self.reply([x for x in every if x["status"] == st])
         if p == "/api/v1/leases/7":
             return self.reply(lease(7, "ready"))
         if p == "/api/v1/leases/8":

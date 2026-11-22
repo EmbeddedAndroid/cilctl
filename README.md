@@ -103,7 +103,8 @@ reaches the API and, given a lease id, the lease.
 
 ```
 cils | setups                 configured profiles and setup recipes
-health | pools | hosts | images | leases
+health | pools | hosts | images
+leases [--all]                live leases; --all also lists released and failed ones
 request <requester> [image] [cpu] [ram_mb] [disk_gb] [ttl_min] [npus]
 wait <id>                     poll until ready and store the key
 up [--name SLUG] [--image I] [--cpu N] [--ram MB] [--disk GB] [--ttl MIN]

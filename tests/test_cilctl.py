@@ -186,6 +186,17 @@ class Api(Base):
 
     def test_lists(self):
         self.assertIn("id=7 status=ready", self.run_cli("leases")[1])
+
+    def test_leases_lists_only_live_leases(self):
+        for url in (self.url, self.url + "/images"):  # /images ignores the filter
+            out = self.run_cli("leases", env={"CILCTL_URL": url})[1]
+            self.assertEqual([l.split()[0] for l in out.splitlines()], ["id=9", "id=7"])
+        out = self.run_cli("leases", "--all")[1]
+        self.assertIn("id=8 status=failed", out)
+        self.assertIn("id=4 status=released", out)
+        rc, _, err = self.run_cli("leases", "bogus")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("usage: leases [--all]", err)
         self.assertRegex(self.run_cli("pools")[1],
                          r"name=arm64 .*env_keys=\['http_proxy', 'https_proxy', 'no_proxy'\]")
         self.assertIn("name=host-1 state=ready", self.run_cli("hosts")[1])
